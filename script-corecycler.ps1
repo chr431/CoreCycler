@@ -178,6 +178,14 @@ $numCoresWithErrorAndMaxVoltageValue     = 0
 $apicIdTool                              = $PSScriptRoot + '\tools\APICID.exe'
 $pboCliTool                              = $PSScriptRoot + '\tools\ryzen-smu-cli\ryzen-smu-cli.exe'
 $intelCliTool                            = $PSScriptRoot + '\tools\IntelVoltageControl\IntelVoltageControl.exe'
+# The ZenStates-Core library ships with SMUDebugTool and is the only included tool that can read and write the
+# PBO max boost frequency (ryzen-smu-cli only handles the Curve Optimizer offsets and the PBO scalar)
+$zenStatesCoreDll                        = $PSScriptRoot + '\tools\SMUDebugTool\ZenStates-Core.dll'
+$zenStatesCoreDirectory                  = $PSScriptRoot + '\tools\SMUDebugTool'
+# The loaded assembly and the Cpu instance, initialized lazily by Initialize-ZenStatesCore
+$zenStatesAssembly                       = $null
+$zenStatesCpu                            = $null
+$zenStatesCoreState                      = 'Uninitialized'
 $autoModeFile                            = $PSScriptRoot + '\.automode'
 $autoModeFileTemp                        = $PSScriptRoot + '\.automode-temp'
 $autoModeFileBak                         = $PSScriptRoot + '\.automode-bak'
@@ -195,6 +203,7 @@ $repeatCoreUntilConfirmed                = $true
 $maxTestsPerCoreSanityLimit              = 0
 $knownGoodValues                         = @{}
 $applyConfirmedValuesForNotTestedCores   = $false
+$applyAllValuesBeforeEachTest            = $false
 $useResumedCoreOrder                     = $false
 $resumedCoreOrder                        = @()
 $resumedIteration                        = 1
@@ -928,6 +937,82 @@ applyConfirmedValuesForNotTestedCores = 0
 #
 # Default: 1
 repeatCoreOnError = 1
+
+
+# Apply the Curve Optimizer / voltage offset values of ALL cores before each test run of a core, even if
+# "setVoltageOnlyForTestedCore" is enabled
+#
+# With "setVoltageOnlyForTestedCore = 1" only the currently tested core receives its value, while all the other
+# cores are set to "voltageValueForNotTestedCores". If a cycle of the test order starts over, or if a core is
+# tested again after an automatic resume, the values of the other cores may not match what the script thinks
+# they are, e.g. because a crash happened in between and the processor was reset to the BIOS defaults
+#
+# Enabling this setting writes the full set of values to the processor again before every single test run, so that
+# the applied state always matches the tracked state. This costs one additional SMU call per test run
+#
+# Note: This is independent of "setVoltageOnlyForTestedCore". With that setting disabled the values are already
+#       applied to all cores on every change, so this setting adds nothing there
+#
+# Default: 0
+applyAllValuesBeforeEachTest = 0
+
+
+# The absolute value in MHz for the PBO max boost frequency ("Max CPU Boost Clock Override" in the BIOS)
+# This is the value the processor will be set to, not an offset, so e.g. 5000 means "max boost 5000 MHz"
+#
+# If this setting is set (i.e. greater than 0), it takes precedence over "pboMaxFrequencyOffset" below
+#
+# The value is also applied once at the start of every CoreCycler run (including after an automatic resume),
+# and the value that the firmware actually accepted is read back and reported
+#
+# Note: This requires the SMU to be reachable, so PawnIO must be installed for Ryzen processors
+# Note: The firmware clamps the value to roughly -1000 to +200 MHz around the fused default of your CPU,
+#       so a value outside of that range may not be applied as requested. The applied value is read back
+# Note: This only works on Zen 4 and upwards. On Zen 2 / Zen 3 the required SMU command does not exist, and the
+#       script will report that the value has been ignored
+# Note: This is NOT persisted either, it is lost on a reboot, just like the Curve Optimizer values
+#
+# IMPORTANT: Changing the maximum boost frequency can make the processor less stable and will void the warranty.
+#            Be sensible about this value!
+#
+# Example: pboMaxFrequency = 5000
+# Default: 0
+pboMaxFrequency = 0
+
+
+# The offset in MHz that is applied to the PBO max boost frequency ("Max CPU Boost Clock Override" in the BIOS)
+# A positive value raises the maximum boost frequency, a negative value lowers it
+#
+# The value is an offset from the currently active max boost frequency, not an absolute frequency, and it is
+# applied once at the start of every CoreCycler run (including after an automatic resume)
+#
+# Note: This setting is ignored if "pboMaxFrequency" above is set
+# Note: This requires the SMU to be reachable, so PawnIO must be installed for Ryzen processors
+# Note: The firmware only accepts roughly -1000 to +200 MHz around the fused default, values outside of that range
+#       are clamped by the script. The applied value is read back and reported
+# Note: This only works on Zen 4 and upwards. On Zen 2 / Zen 3 the required SMU command does not exist, and the
+#       script will report that the offset has been ignored
+# Note: This is NOT persisted either, it is lost on a reboot, just like the Curve Optimizer values
+#
+# IMPORTANT: Raising the maximum boost frequency can make the processor less stable and will void the warranty.
+#            Be sensible about this value!
+#
+# Example: pboMaxFrequencyOffset = 50
+# Default: 0
+pboMaxFrequencyOffset = 0
+
+
+# Show the currently applied PBO settings at the start of the script
+# This prints the Curve Optimizer value of every core, the PBO limits (PPT / TDC / EDC), the PBO scalar and the
+# max boost frequency, as they are currently applied to the processor
+#
+# Note: This does not change any settings, it is purely informational, and it also works without the
+#       Automatic Test Mode being enabled
+# Note: Reading the PBO limits requires the SMU to be reachable, so PawnIO must be installed for Ryzen processors
+#       The Curve Optimizer values are read with ryzen-smu-cli, which requires administrator privileges
+#
+# Default: 1
+showCurrentPboSettings = 1
 
 
 # Try to automatically resume after a crash / hard reboot
@@ -6605,6 +6690,7 @@ function Initialize-AutomaticTestMode {
     $Script:passesToConfirmCoreValue              = [Math]::Max(1, [Int] $settings.AutomaticTestMode.passesToConfirmCoreValue)
     $Script:repeatCoreUntilConfirmed              = ($settings.AutomaticTestMode.repeatCoreUntilConfirmed -gt 0)
     $Script:applyConfirmedValuesForNotTestedCores = ($settings.AutomaticTestMode.applyConfirmedValuesForNotTestedCores -gt 0)
+    $Script:applyAllValuesBeforeEachTest          = ($settings.AutomaticTestMode.applyAllValuesBeforeEachTest -gt 0)
 
 
     # The values that the user has already found to be good, these cores will not be tested at all
@@ -6745,6 +6831,11 @@ function Initialize-AutomaticTestMode {
     if (!$setVoltageOnlyForTestedCore) {
         Set-NewVoltageValues
     }
+
+
+    # Apply the configured PBO max boost frequency offset
+    # This is independent of the Curve Optimizer values, and it is applied on every run, including a resume
+    Set-ConfiguredPboMaxFrequency
 
 
     Write-VerboseText('The starting value(s):')
@@ -6916,12 +7007,17 @@ function Get-CurveOptimizerValues {
 <#
 .DESCRIPTION
     Set the new Curve Optimizer values
-.PARAMETER
-    [Void]
+.PARAMETER allCores
+    [Switch] (optional) If set, the values of ALL cores are applied, even when only the currently tested
+    core is supposed to be set ("setVoltageOnlyForTestedCore"). This is used to make sure that the values
+    that are actually applied to the processor match the tracked state before a test run starts
 .OUTPUTS
     [Void]
 #>
 function Set-CurveOptimizerValues {
+    param(
+        [Parameter(Mandatory=$false)] [Switch] $allCores
+    )
     <#
     .DESCRIPTION
         Error handler function for the for loop
@@ -6956,7 +7052,8 @@ function Set-CurveOptimizerValues {
 
 
         # If we only want to set the currently tested core, set the others to max($voltageValueForNotTestedCores, currentvalue)
-        if ($setVoltageOnlyForTestedCore) {
+        # The -allCores switch overrides this, so that the whole set of values is written to the processor
+        if ($setVoltageOnlyForTestedCore -and !$allCores) {
             Write-DebugText('The flag to only set the voltage for the currently tested core is enabled')
             Write-DebugText('Currently tested core: ' + $Script:currentlyTestedCore)
             Write-DebugText('The original values:')
@@ -7082,6 +7179,564 @@ function Set-CurveOptimizerValues {
     }
     catch {
         throw('Could not set the Curve Optimizer values!' + [Environment]::NewLine + 'Reason: ' + $_)
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Load the ZenStates-Core assembly and create the Cpu instance, which is required for the PBO max boost frequency
+    and for reading the PBO limits. ryzen-smu-cli cannot do either of those, it only handles the Curve Optimizer
+    offsets and the PBO scalar.
+    The initialization is done lazily and only once, the result is cached in $zenStatesCoreState
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Bool] $true if the Cpu instance is available, otherwise $false
+#>
+function Initialize-ZenStatesCore {
+    # Already been here, use the cached result
+    if ($zenStatesCoreState -ne 'Uninitialized') {
+        Write-DebugText('The ZenStates-Core state has already been determined: ' + $zenStatesCoreState)
+        return ($zenStatesCoreState -eq 'OK')
+    }
+
+    # Only Ryzen processors can use this, and it is an additional, optional feature, so we never abort the script
+    if ($isIntelProcessor) {
+        Write-DebugText('Not a Ryzen processor, the ZenStates-Core library is not required')
+        $Script:zenStatesCoreState = 'Unsupported'
+        return $false
+    }
+
+    if (!(Test-Path -LiteralPath $zenStatesCoreDll -PathType Leaf)) {
+        Write-DebugText('The ZenStates-Core library could not be found at: ' + $zenStatesCoreDll)
+        $Script:zenStatesCoreState = 'Missing'
+        return $false
+    }
+
+    try {
+        Write-DebugText('Loading the ZenStates-Core library')
+
+        # The library loads inpoutx64.dll from its own directory, which is not where the script is started from
+        $env:PATH = $zenStatesCoreDirectory + ';' + $env:PATH
+
+        $Script:zenStatesAssembly = [Reflection.Assembly]::LoadFrom($zenStatesCoreDll)
+
+        $initSettingsType = $zenStatesAssembly.GetType('ZenStates.Core.CpuInitSettings')
+        $cpuType          = $zenStatesAssembly.GetType('ZenStates.Core.Cpu')
+
+        if (!$initSettingsType -or !$cpuType) {
+            throw('The expected types could not be found in the assembly')
+        }
+
+        # The library writes some diagnostics straight to the console (e.g. about the ACPI tables),
+        # which has nothing to do with the script's own output, so we swallow it here
+        $consoleOutput = New-Object System.IO.StringWriter
+        $originalOut  = [Console]::Out
+        $originalErr  = [Console]::Error
+
+        [Console]::SetOut($consoleOutput)
+        [Console]::SetError($consoleOutput)
+
+        try {
+            $initSettings = [Activator]::CreateInstance($initSettingsType)
+            $Script:zenStatesCpu = [Activator]::CreateInstance($cpuType, @($initSettings))
+        }
+        finally {
+            [Console]::SetOut($originalOut)
+            [Console]::SetError($originalErr)
+        }
+
+        if (!$zenStatesCpu) {
+            throw('The Cpu instance could not be created')
+        }
+
+        Write-DebugText('The library has been loaded, the processor has been detected as: ' + $zenStatesCpu.info.codeName)
+
+        # A reported error usually means the SMU is not responding, which happens when PawnIO is not installed
+        # or when the script is not running with administrator privileges
+        # It can however also be a leftover from an unrelated part of the initialization (e.g. reading the ACPI
+        # tables), so this is only reported and never used to disable the functionality
+        if ($zenStatesCpu.LastError) {
+            Write-DebugText('The library reported an error: ' + $zenStatesCpu.LastError.Message)
+        }
+
+        $Script:zenStatesCoreState = 'OK'
+        return $true
+    }
+    catch {
+        Write-DebugText('The ZenStates-Core library could not be initialized: ' + $_.Exception.Message)
+        $Script:zenStatesCoreState = 'Failed'
+        return $false
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Check if the PBO max boost frequency can be written on this processor
+    ryzen-smu-cli cannot do this at all, and even in ZenStates-Core the required SMU message only exists for
+    Zen 4 and upwards. On Zen 2 / Zen 3 only the read message is defined, so any write attempt would be rejected
+    by the SMU and SetFMax would return $false without changing anything
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Bool] $true if the max boost frequency can be written, otherwise $false
+#>
+function Test-PboMaxFrequencyIsWritable {
+    if (!(Initialize-ZenStatesCore)) {
+        return $false
+    }
+
+    try {
+        $rsmuMailbox = $zenStatesCpu.smu.Rsmu
+
+        # The SMU message ID for setting the boost limit for all cores, 0 means "not available on this CPU"
+        $setBoostLimitCommand = [UInt32] $rsmuMailbox.SMU_MSG_SetBoostLimitFrequencyAllCores
+
+        Write-DebugText('The SMU message ID to set the max boost frequency: 0x' + ('{0:X}' -f $setBoostLimitCommand))
+
+        return ($setBoostLimitCommand -ne 0)
+    }
+    catch {
+        Write-DebugText('Could not determine if the max boost frequency is writable: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Get the currently applied PBO max boost frequency (the "Max CPU Boost Clock Override" from the BIOS)
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Int] The max boost frequency in MHz, or -1 if it could not be determined
+#>
+function Get-PboMaxFrequency {
+    if (!(Initialize-ZenStatesCore)) {
+        return -1
+    }
+
+    try {
+        $maxFrequency = [UInt32] $zenStatesCpu.GetFMax()
+
+        # A failed read returns 0, which is not a frequency that could ever be set, so we treat it as unknown
+        if ($maxFrequency -eq 0) {
+            Write-DebugText('The max boost frequency could not be read (the read returned 0)')
+            return -1
+        }
+
+        Write-DebugText('The max boost frequency that has been read: ' + $maxFrequency + ' MHz')
+        return [Int] $maxFrequency
+    }
+    catch {
+        Write-DebugText('Could not read the max boost frequency: ' + $_.Exception.Message)
+        return -1
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Set the PBO max boost frequency (the "Max CPU Boost Clock Override" from the BIOS)
+.PARAMETER frequency
+    [Int] The max boost frequency in MHz
+.OUTPUTS
+    [Bool] $true if the value was accepted by the SMU
+#>
+function Set-PboMaxFrequency {
+    param(
+        [Parameter(Mandatory=$true)] [Int] $frequency
+    )
+
+    if (!(Initialize-ZenStatesCore)) {
+        return $false
+    }
+
+    try {
+        Write-DebugText('Setting the max boost frequency to ' + $frequency + ' MHz')
+
+        $success = [bool] $zenStatesCpu.SetFMax([UInt32] $frequency)
+
+        if (!$success) {
+            Write-DebugText('The SMU did not accept the max boost frequency')
+            return $false
+        }
+
+        # The firmware clamps the value to a range around the fused default and silently accepts out of range
+        # requests, so the value is read back and compared instead of trusting the return value alone
+        $appliedFrequency = [UInt32] $zenStatesCpu.GetFMax()
+
+        if ($appliedFrequency -eq 0) {
+            Write-VerboseText('The max boost frequency could not be verified after setting it')
+            return $true
+        }
+
+        if ($appliedFrequency -ne [UInt32] $frequency) {
+            Write-VerboseText('The requested max boost frequency of ' + $frequency + ' MHz was adjusted to ' + $appliedFrequency + ' MHz by the firmware')
+        }
+
+        return $true
+    }
+    catch {
+        Write-DebugText('Could not set the max boost frequency: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Get the currently applied PBO limits (PPT, TDC and EDC) from the power table
+    These are the limits that the SMU is currently enforcing, which may come from the BIOS or from a tool
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Hashtable] The limits in watts / amps, or $null if they could not be read
+#>
+function Get-PboLimits {
+    if (!(Initialize-ZenStatesCore)) {
+        return $null
+    }
+
+    try {
+        # The status is an enum whose OK member is 1 (not 0), and it depends on the processor family,
+        # so it must be compared by name instead of against a numeric value
+        $refreshStatus = $zenStatesCpu.RefreshPowerTable()
+
+        if ($refreshStatus.ToString() -ne 'OK') {
+            Write-DebugText('The power table could not be refreshed: ' + $refreshStatus.ToString())
+            return $null
+        }
+
+        $powerTable = $zenStatesCpu.powerTable.Table
+
+        if (!$powerTable -or $powerTable.Length -lt 21) {
+            Write-DebugText('The power table is empty or too short to hold the PBO limits')
+            return $null
+        }
+
+        # The power table starts with the limits: PPT at 0x08, TDC at 0x20 and the thermal limit at 0x28
+        # The EDC limit sits behind a variable-length block, so its offset has to be located by matching the
+        # VID / power telemetry pair that the telemetry group repeats (see RyzenAdj and RyzenPboStudio)
+        # The search reads up to index+16, so it has to stop early enough that the read stays in bounds
+        $edcLimit = -1.0
+        $vidReference = $powerTable[19]
+        $powerReference = $powerTable[20]
+
+        if ($vidReference -gt 0.3 -and $vidReference -lt 2.0 -and $powerReference -gt 0) {
+            $lastCandidate = [Math]::Min(199, $powerTable.Length - 17)
+
+            for ($i = 24; $i -le $lastCandidate; $i++) {
+                if ($powerTable[$i] -eq $vidReference -and $powerTable[$i + 3] -eq $powerReference -and $powerTable[$i + 2] -gt 0) {
+                    $edcLimit = $powerTable[$i + 15]
+                    break
+                }
+            }
+        }
+
+        # A value of 999 is the SMU's "no limit" marker and not an actual limit
+        $isUnlimited = ($powerTable[2] -ge 999 -and $powerTable[8] -ge 999)
+
+        return @{
+            'ppt'          = [Double] $powerTable[2]
+            'tdc'          = [Double] $powerTable[8]
+            'edc'          = [Double] $edcLimit
+            'thermalLimit' = [Double] $powerTable[10]
+            'isUnlimited'  = $isUnlimited
+        }
+    }
+    catch {
+        Write-DebugText('Could not read the PBO limits: ' + $_.Exception.Message)
+        return $null
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Get the currently applied PBO scalar
+    ryzen-smu-cli is used for this, as it already has a stable implementation for it
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [String] The scalar value, or an empty string if it could not be read
+#>
+function Get-PboScalar {
+    if ($isIntelProcessor) {
+        return ''
+    }
+
+    # ryzen-smu-cli refuses to run without administrator privileges, so there is no point in trying
+    if (!$areWeAdmin) {
+        Write-DebugText('No administrator privileges, skipping the PBO scalar query')
+        return ''
+    }
+
+    try {
+        $getScalarProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $getScalarProcessInfo.FileName = $pboCliTool
+        $getScalarProcessInfo.Arguments = '--get-pbo-scalar'
+        $getScalarProcessInfo.Verb = 'runas'
+        $getScalarProcessInfo.RedirectStandardError = $true
+        $getScalarProcessInfo.RedirectStandardOutput = $true
+        $getScalarProcessInfo.UseShellExecute = $false
+
+        $getScalarProcess = New-Object System.Diagnostics.Process
+        $getScalarProcess.StartInfo = $getScalarProcessInfo
+        $null = $getScalarProcess.Start()
+
+        $stdOut = $getScalarProcess.StandardOutput.ReadToEnd()
+        $stdErr = $getScalarProcess.StandardError.ReadToEnd()
+
+        if (!$getScalarProcess.WaitForExit(3000)) {
+            $getScalarProcess.Kill()
+            $getScalarProcess.Close()
+            $getScalarProcess.Dispose()
+
+            Write-DebugText('The PBO scalar query did not exit within three seconds')
+            return ''
+        }
+
+        $getScalarProcess.Close()
+        $getScalarProcess.Dispose()
+
+        if ($stdErr -and $stdErr.Length -gt 0) {
+            Write-DebugText('Error while querying the PBO scalar: ' + $stdErr.Trim())
+            return ''
+        }
+
+        $stdOut = $stdOut.Trim().Trim(' ', '"', '''', [Char]0x09)
+
+        if (!$stdOut) {
+            Write-DebugText('The PBO scalar query returned an empty value')
+            return ''
+        }
+
+        # The output looks like "Current PBO scalar: 1", so only the number is of interest
+        if ($stdOut -Match '([0-9]+(\.[0-9]+)?)\s*$') {
+            return $Matches[1]
+        }
+
+        Write-DebugText('The PBO scalar could not be parsed from: ' + $stdOut)
+        return ''
+    }
+    catch {
+        Write-DebugText('Could not query the PBO scalar: ' + $_.Exception.Message)
+        return ''
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Print the currently applied PBO settings: the Curve Optimizer value of every core, the PBO limits,
+    the PBO scalar and the max boost frequency
+    This is meant to be shown at the start of a run, so that it is clear which settings the test is based on
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Void]
+#>
+function Show-PboSettings {
+    # Intel has no Curve Optimizer, no PBO limits that could be read and no max boost frequency
+    if ($isIntelProcessor) {
+        return
+    }
+
+
+    # Without administrator privileges neither ryzen-smu-cli nor the SMU driver can be used,
+    # so we can only tell the user why nothing is displayed
+    if (!$areWeAdmin) {
+        Write-Text('')
+        Write-ColorText('┌─────────────────────────────────┤ IMPORTANT ├────────────────────────────────┐') Yellow
+        Write-ColorText('│ ' + 'The currently applied PBO settings cannot be read, as reading'.PadRight(76, ' ') + ' │') Yellow
+        Write-ColorText('│ ' + 'them requires administrator privileges.'.PadRight(76, ' ') + ' │') Yellow
+        Write-ColorText('└──────────────────────────────────────────────────────────────────────────────┘') Yellow
+        Write-Text('')
+
+        return
+    }
+
+
+    # The Curve Optimizer values, either from the tracked state or read from the processor
+    $coValues = $null
+
+    if ($voltageCurrentValues -and @($voltageCurrentValues).Count -gt 0) {
+        $coValues = @($voltageCurrentValues)
+    }
+    else {
+        try {
+            $coValues = @(Get-CurveOptimizerValues)
+        }
+        catch {
+            Write-DebugText('Could not read the Curve Optimizer values: ' + $_.Exception.Message)
+        }
+    }
+
+
+    Write-Text('')
+    Write-ColorText('────────────────────────────────────────────────────────────────────────────────') Cyan
+    Write-ColorText('Currently applied PBO settings') Cyan
+    Write-ColorText('────────────────────────────────────────────────────────────────────────────────') Cyan
+    Write-Text('')
+
+
+    # The Curve Optimizer value of every core
+    if ($coValues -and $coValues.Count -gt 0) {
+        $coreLabels = (0..($coValues.Count - 1)) | ForEach-Object { ('C' + $_.ToString()).PadLeft(4, ' ') }
+        $coStrings  = $coValues | ForEach-Object { $_.ToString().PadLeft(4, ' ') }
+
+        Write-ColorText('Core            ' + ($coreLabels -Join ' |')) Cyan
+        Write-ColorText('CO values       ' + ($coStrings  -Join ' |')) Cyan
+    }
+    else {
+        Write-SettingIntroText -Text 'CO values' -Setting 'could not be read'
+    }
+
+
+    # The PBO limits and the scalar are read from the processor directly, as they may have been changed
+    # by a tool or by a previous run of the script
+    $pboLimits = Get-PboLimits
+
+    if ($pboLimits) {
+        # A value of 999 is the SMU's "no limit" marker and not an actual limit
+        if ($pboLimits['isUnlimited']) {
+            Write-SettingIntroText -Text 'PPT limit' -Setting 'unlimited'
+            Write-SettingIntroText -Text 'TDC limit' -Setting 'unlimited'
+        }
+        else {
+            Write-SettingIntroText -Text 'PPT limit' -Setting ([Math]::Round($pboLimits['ppt']).ToString() + ' W')
+            Write-SettingIntroText -Text 'TDC limit' -Setting ([Math]::Round($pboLimits['tdc']).ToString() + ' A')
+        }
+
+        if ($pboLimits['edc'] -ge 0) {
+            Write-SettingIntroText -Text 'EDC limit' -Setting ([Math]::Round($pboLimits['edc']).ToString() + ' A')
+        }
+        else {
+            Write-SettingIntroText -Text 'EDC limit' -Setting 'could not be determined'
+        }
+
+        Write-SettingIntroText -Text 'Thermal limit' -Setting ([Math]::Round($pboLimits['thermalLimit']).ToString() + ' °C')
+    }
+    else {
+        Write-SettingIntroText -Text 'PBO limits (PPT / TDC / EDC)' -Setting 'could not be read'
+    }
+
+
+    $pboScalar = Get-PboScalar
+
+    if ($pboScalar) {
+        Write-SettingIntroText -Text 'PBO scalar' -Setting $pboScalar
+    }
+    else {
+        Write-SettingIntroText -Text 'PBO scalar' -Setting 'could not be read'
+    }
+
+
+    $maxFrequency = Get-PboMaxFrequency
+
+    if ($maxFrequency -gt 0) {
+        Write-SettingIntroText -Text 'Max boost frequency' -Setting ($maxFrequency.ToString() + ' MHz')
+    }
+    else {
+        Write-SettingIntroText -Text 'Max boost frequency' -Setting 'could not be read'
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Apply the configured PBO max boost frequency
+    This handles both the absolute "pboMaxFrequency" setting and the relative "pboMaxFrequencyOffset" setting,
+    with the absolute value taking precedence if it is set
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Void]
+#>
+function Set-ConfiguredPboMaxFrequency {
+    if ($isIntelProcessor) {
+        return
+    }
+
+    $absoluteFrequency  = [Int] $settings['AutomaticTestMode']['pboMaxFrequency']
+    $maxFrequencyOffset = [Int] $settings['AutomaticTestMode']['pboMaxFrequencyOffset']
+
+    # Nothing to do
+    if ($absoluteFrequency -le 0 -and $maxFrequencyOffset -eq 0) {
+        return
+    }
+
+    Write-VerboseText('Trying to apply the configured PBO max boost frequency')
+
+
+    if (!(Test-PboMaxFrequencyIsWritable)) {
+        Write-VerboseText('This processor does not support setting the max boost frequency, the value will be ignored')
+        Write-VerboseText('(The required SMU command is only available on Zen 4 and upwards)')
+        return
+    }
+
+
+    if ($absoluteFrequency -gt 0) {
+        # An absolute value is used as-is, rounded to the nearest step the firmware accepts
+        # The upper bound is a sanity limit: the firmware would clamp anything higher anyway, and a value
+        # this high is a configuration mistake rather than an intention
+        if ($absoluteFrequency -gt 9000) {
+            Write-ColorText('The requested max boost frequency of ' + $absoluteFrequency + ' MHz is out of range, ignoring it') Yellow
+            return
+        }
+
+        $targetFrequency = [Int] ([Math]::Round($absoluteFrequency / 25) * 25)
+
+        Write-VerboseText('The requested max boost frequency: ' + $absoluteFrequency + ' MHz')
+        Write-VerboseText('The value that will be applied:    ' + $targetFrequency + ' MHz')
+    }
+    else {
+        # The offset is relative to the currently active value, as the firmware only accepts values within a
+        # limited range around the fused default and would silently clamp an absolute value
+        $currentFrequency = Get-PboMaxFrequency
+
+        if ($currentFrequency -le 0) {
+            Write-VerboseText('The current max boost frequency could not be read, the offset will be ignored')
+            return
+        }
+
+        # The firmware accepts roughly -1000 to +200 MHz around the fused default, so we clamp to that range
+        $targetFrequency = $currentFrequency + $maxFrequencyOffset
+        $targetFrequency = [Math]::Max($currentFrequency - 1000, [Math]::Min($currentFrequency + 200, $targetFrequency))
+        $targetFrequency = [Math]::Max(500, $targetFrequency)
+
+        $targetFrequency = [Int] ([Math]::Round($targetFrequency / 25) * 25)
+
+
+        Write-VerboseText('The current max boost frequency:  ' + $currentFrequency + ' MHz')
+        Write-VerboseText('The requested offset:             ' + $maxFrequencyOffset + ' MHz')
+        Write-VerboseText('The value that will be applied:   ' + $targetFrequency + ' MHz')
+    }
+
+
+    if (Set-PboMaxFrequency -frequency $targetFrequency) {
+        $appliedFrequency = Get-PboMaxFrequency
+
+        if ($appliedFrequency -gt 0) {
+            Write-ColorText('The PBO max boost frequency has been set to ' + $appliedFrequency + ' MHz') Cyan
+        }
+        else {
+            Write-ColorText('The PBO max boost frequency has been set to ' + $targetFrequency + ' MHz') Cyan
+        }
+    }
+    else {
+        Write-ColorText('The PBO max boost frequency could not be set!') Yellow
     }
 }
 
@@ -7264,8 +7919,12 @@ function Set-IntelVoltageOffset {
     Sets the new Curve Optimizer / voltage offset values
 #>
 function Set-NewVoltageValues {
+    param(
+        [Parameter(Mandatory=$false)] [Switch] $allCores
+    )
+
     if ($useCurveOptimizer) {
-        Set-CurveOptimizerValues
+        Set-CurveOptimizerValues -allCores:$allCores
     }
     elseif ($useIntelVoltageAdjustment) {
         Set-IntelVoltageOffset
@@ -14424,9 +15083,27 @@ try {
             Write-SettingIntroText -Text 'Apply confirmed values to other cores' -Setting ($(if ($applyConfirmedValuesForNotTestedCores) { 'ENABLED' } else { 'DISABLED' }))
         }
 
+        if ($useCurveOptimizer -and $applyAllValuesBeforeEachTest) {
+            Write-SettingIntroText -Text 'Apply all values before each test'    -Setting ('ENABLED')
+        }
+
+        if ($useCurveOptimizer -and [Int] $settings.AutomaticTestMode.pboMaxFrequency -gt 0) {
+            Write-SettingIntroText -Text 'PBO max boost frequency'             -Setting ($settings.AutomaticTestMode.pboMaxFrequency.ToString() + ' MHz')
+        }
+        elseif ($useCurveOptimizer -and [Int] $settings.AutomaticTestMode.pboMaxFrequencyOffset -ne 0) {
+            Write-SettingIntroText -Text 'PBO max boost frequency offset'       -Setting ($settings.AutomaticTestMode.pboMaxFrequencyOffset.ToString() + ' MHz')
+        }
+
         if ($useIntelVoltageAdjustment) {
             Write-SettingIntroText -Text 'Starting voltage offset value'        -Setting ($voltageStartingValues[0].ToString() + 'mv')
         }
+    }
+
+
+    # Show the PBO settings that are currently applied to the processor
+    # This is done for both modes, so that it is always visible which settings a test run is based on
+    if ($settings.AutomaticTestMode.showCurrentPboSettings -gt 0) {
+        Show-PboSettings
     }
 
 
@@ -15312,7 +15989,14 @@ try {
 
 
             # Set the voltage for the currently selected core
-            if ($setVoltageOnlyForTestedCore) {
+            # If the setting to apply all of the values before each test run is enabled, the values of all cores
+            # are written again instead, so that the state that is applied to the processor always matches the
+            # tracked state, even if a crash in between has reset the processor to its defaults
+            if ($applyAllValuesBeforeEachTest) {
+                Write-VerboseText('Applying the values of all cores before the test run')
+                Set-NewVoltageValues -allCores
+            }
+            elseif ($setVoltageOnlyForTestedCore) {
                 Write-VerboseText('Setting the voltage for the currently tested core')
                 Set-NewVoltageValues
             }

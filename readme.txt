@@ -132,6 +132,32 @@ not start the whole test order from the beginning again.
    NOTE: Always exit CoreCycler with CTRL+C. If you just close the window, the Scheduled Task will remain and will
          be executed on the next reboot.
 
+These are the PBO settings the run is based on:
+- At the start of every run, CoreCycler prints the PBO settings that are currently applied to the processor, which
+  you can turn off with "showCurrentPboSettings = 0". This shows the Curve Optimizer value of every core, the PBO
+  limits (PPT / TDC / EDC), the PBO scalar and the max boost frequency. It also works outside of the Automatic Test
+  Mode, so you can always check what your processor is currently running with.
+   NOTE: Reading these values requires administrator privileges and PawnIO (for Ryzen).
+- With "pboMaxFrequency" you can set the PBO max boost frequency to an absolute value in MHz, which is the
+  "Max CPU Boost Clock Override" setting in your BIOS. E.g. "pboMaxFrequency = 5000" sets the maximum boost
+  frequency to 5000 MHz. The value is applied at the start of every run, including after an automatic resume, and
+  the value that the firmware actually accepted is reported back.
+   NOTE: The firmware clamps the value to roughly -1000 to +200 MHz around the fused default of your CPU, so a
+         value outside of that range may not be applied as requested. The applied value is read back and reported.
+   NOTE: This is only supported on Zen 4 and upwards. On older processors the required SMU command does not exist
+         and the script will tell you that the value has been ignored.
+   NOTE: Like the Curve Optimizer values, this is NOT permanent and is lost on a reboot.
+   WARNING: Changing the maximum boost frequency makes the processor less stable and will void the warranty.
+- With "pboMaxFrequencyOffset" you can apply an offset in MHz to the PBO max boost frequency instead, e.g.
+  "pboMaxFrequencyOffset = 50" raises the maximum boost frequency by 50 MHz above whatever it currently is.
+  This setting is ignored if "pboMaxFrequency" above is set.
+- With "applyAllValuesBeforeEachTest" you can make CoreCycler write the values of all cores again before every
+  single test run. This is mainly useful in combination with "setVoltageOnlyForTestedCore", where otherwise only
+  the tested core receives its value while all the other cores are set to "voltageValueForNotTestedCores". After a
+  crash and a reboot the processor falls back to the BIOS defaults, so the values that are actually applied may not
+  match what CoreCycler thinks they are; this setting makes sure they always match. It costs one additional SMU
+  call per test run.
+
 Other notes:
 - Because a crash cannot be attributed to a specific core with certainty, it is highly recommended to also enable
   "setVoltageOnlyForTestedCore", so that all of the other cores run at a safe value while one core is being tested.
