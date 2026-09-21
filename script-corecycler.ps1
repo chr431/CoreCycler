@@ -203,7 +203,7 @@ $repeatCoreUntilConfirmed                = $true
 $maxTestsPerCoreSanityLimit              = 0
 $knownGoodValues                         = @{}
 $applyConfirmedValuesForNotTestedCores   = $false
-$applyAllValuesBeforeEachTest            = $false
+$applyValuesBeforeEachTest            = $false
 $useResumedCoreOrder                     = $false
 $resumedCoreOrder                        = @()
 $resumedIteration                        = 1
@@ -939,22 +939,22 @@ applyConfirmedValuesForNotTestedCores = 0
 repeatCoreOnError = 1
 
 
-# Apply the Curve Optimizer / voltage offset values of ALL cores before each test run of a core, even if
-# "setVoltageOnlyForTestedCore" is enabled
+# Apply the Curve Optimizer / voltage offset values before every test run of a core
 #
-# With "setVoltageOnlyForTestedCore = 1" only the currently tested core receives its value, while all the other
-# cores are set to "voltageValueForNotTestedCores". If a cycle of the test order starts over, or if a core is
-# tested again after an automatic resume, the values of the other cores may not match what the script thinks
-# they are, e.g. because a crash happened in between and the processor was reset to the BIOS defaults
+# Which values are written always follows the "setVoltageOnlyForTestedCore" setting:
+# - with it enabled, only the currently tested core receives its target value and all the other cores are set to
+#   "voltageValueForNotTestedCores"
+# - with it disabled, every core receives its own value
 #
-# Enabling this setting writes the full set of values to the processor again before every single test run, so that
-# the applied state always matches the tracked state. This costs one additional SMU call per test run
-#
-# Note: This is independent of "setVoltageOnlyForTestedCore". With that setting disabled the values are already
-#       applied to all cores on every change, so this setting adds nothing there
+# With "setVoltageOnlyForTestedCore = 1" the values are applied per core anyway, so enabling this setting changes
+# nothing there. It is meant for the case where "setVoltageOnlyForTestedCore" is disabled: without this setting the
+# values are then only applied at the start of the run and whenever a value is increased, so after a crash and a
+# reboot (where the processor falls back to the BIOS defaults) the applied state may no longer match the values
+# that are tracked by the script. Enabling this setting re-applies them before every single test run instead, at
+# the cost of one additional SMU call per test run
 #
 # Default: 0
-applyAllValuesBeforeEachTest = 0
+applyValuesBeforeEachTest = 0
 
 
 # The absolute value in MHz for the PBO max boost frequency ("Max CPU Boost Clock Override" in the BIOS)
@@ -6690,7 +6690,7 @@ function Initialize-AutomaticTestMode {
     $Script:passesToConfirmCoreValue              = [Math]::Max(1, [Int] $settings.AutomaticTestMode.passesToConfirmCoreValue)
     $Script:repeatCoreUntilConfirmed              = ($settings.AutomaticTestMode.repeatCoreUntilConfirmed -gt 0)
     $Script:applyConfirmedValuesForNotTestedCores = ($settings.AutomaticTestMode.applyConfirmedValuesForNotTestedCores -gt 0)
-    $Script:applyAllValuesBeforeEachTest          = ($settings.AutomaticTestMode.applyAllValuesBeforeEachTest -gt 0)
+    $Script:applyValuesBeforeEachTest          = ($settings.AutomaticTestMode.applyValuesBeforeEachTest -gt 0)
 
 
     # The values that the user has already found to be good, these cores will not be tested at all
@@ -7007,17 +7007,12 @@ function Get-CurveOptimizerValues {
 <#
 .DESCRIPTION
     Set the new Curve Optimizer values
-.PARAMETER allCores
-    [Switch] (optional) If set, the values of ALL cores are applied, even when only the currently tested
-    core is supposed to be set ("setVoltageOnlyForTestedCore"). This is used to make sure that the values
-    that are actually applied to the processor match the tracked state before a test run starts
+.PARAMETER
+    [Void]
 .OUTPUTS
     [Void]
 #>
 function Set-CurveOptimizerValues {
-    param(
-        [Parameter(Mandatory=$false)] [Switch] $allCores
-    )
     <#
     .DESCRIPTION
         Error handler function for the for loop
@@ -7052,8 +7047,7 @@ function Set-CurveOptimizerValues {
 
 
         # If we only want to set the currently tested core, set the others to max($voltageValueForNotTestedCores, currentvalue)
-        # The -allCores switch overrides this, so that the whole set of values is written to the processor
-        if ($setVoltageOnlyForTestedCore -and !$allCores) {
+        if ($setVoltageOnlyForTestedCore) {
             Write-DebugText('The flag to only set the voltage for the currently tested core is enabled')
             Write-DebugText('Currently tested core: ' + $Script:currentlyTestedCore)
             Write-DebugText('The original values:')
@@ -7919,12 +7913,8 @@ function Set-IntelVoltageOffset {
     Sets the new Curve Optimizer / voltage offset values
 #>
 function Set-NewVoltageValues {
-    param(
-        [Parameter(Mandatory=$false)] [Switch] $allCores
-    )
-
     if ($useCurveOptimizer) {
-        Set-CurveOptimizerValues -allCores:$allCores
+        Set-CurveOptimizerValues
     }
     elseif ($useIntelVoltageAdjustment) {
         Set-IntelVoltageOffset
@@ -15083,8 +15073,8 @@ try {
             Write-SettingIntroText -Text 'Apply confirmed values to other cores' -Setting ($(if ($applyConfirmedValuesForNotTestedCores) { 'ENABLED' } else { 'DISABLED' }))
         }
 
-        if ($useCurveOptimizer -and $applyAllValuesBeforeEachTest) {
-            Write-SettingIntroText -Text 'Apply all values before each test'    -Setting ('ENABLED')
+        if ($useCurveOptimizer -and $applyValuesBeforeEachTest) {
+            Write-SettingIntroText -Text 'Apply values before each test'        -Setting ('ENABLED')
         }
 
         if ($useCurveOptimizer -and [Int] $settings.AutomaticTestMode.pboMaxFrequency -gt 0) {
@@ -15988,16 +15978,17 @@ try {
             }
 
 
-            # Set the voltage for the currently selected core
-            # If the setting to apply all of the values before each test run is enabled, the values of all cores
-            # are written again instead, so that the state that is applied to the processor always matches the
-            # tracked state, even if a crash in between has reset the processor to its defaults
-            if ($applyAllValuesBeforeEachTest) {
-                Write-VerboseText('Applying the values of all cores before the test run')
-                Set-NewVoltageValues -allCores
-            }
-            elseif ($setVoltageOnlyForTestedCore) {
-                Write-VerboseText('Setting the voltage for the currently tested core')
+            # Set the voltage before the test run
+            # The values that are written always follow the "setVoltageOnlyForTestedCore" setting:
+            # with it enabled only the tested core receives its target value while all the other cores are set to
+            # "voltageValueForNotTestedCores", and with it disabled every core keeps its own value
+            #
+            # With "setVoltageOnlyForTestedCore" the values are applied per core anyway, so nothing changes here
+            # Enabling "applyValuesBeforeEachTest" additionally applies them before every test run even when
+            # "setVoltageOnlyForTestedCore" is disabled, where they would otherwise only be applied at the start of
+            # the run and after a value has been increased
+            if ($setVoltageOnlyForTestedCore -or $applyValuesBeforeEachTest) {
+                Write-VerboseText('Setting the voltage values before the test run')
                 Set-NewVoltageValues
             }
 

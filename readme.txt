@@ -151,11 +151,12 @@ These are the PBO settings the run is based on:
 - With "pboMaxFrequencyOffset" you can apply an offset in MHz to the PBO max boost frequency instead, e.g.
   "pboMaxFrequencyOffset = 50" raises the maximum boost frequency by 50 MHz above whatever it currently is.
   This setting is ignored if "pboMaxFrequency" above is set.
-- With "applyAllValuesBeforeEachTest" you can make CoreCycler write the values of all cores again before every
-  single test run. This is mainly useful in combination with "setVoltageOnlyForTestedCore", where otherwise only
-  the tested core receives its value while all the other cores are set to "voltageValueForNotTestedCores". After a
-  crash and a reboot the processor falls back to the BIOS defaults, so the values that are actually applied may not
-  match what CoreCycler thinks they are; this setting makes sure they always match. It costs one additional SMU
+- With "applyValuesBeforeEachTest" you can make CoreCycler write the values again before every single test run.
+  Which values are written always follows the "setVoltageOnlyForTestedCore" setting, so this never changes which
+  core runs at which value. It is meant for the case where "setVoltageOnlyForTestedCore" is disabled: the values
+  are then only applied at the start of the run and when a value is increased, so after a crash and a reboot (where
+  the processor falls back to the BIOS defaults) the applied state may no longer match what CoreCycler tracks.
+  With this setting enabled they are re-applied before every test run instead, at the cost of one additional SMU
   call per test run.
 
 Other notes:
