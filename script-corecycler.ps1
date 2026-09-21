@@ -51,7 +51,11 @@ Write-Host('Press CTRL+C to abort') -ForegroundColor Yellow
 # Global variables
 $scriptProcessId               = $PID
 $parentProcessId               = (Get-CimInstance Win32_Process -Filter "ProcessId = $($PID)").ParentProcessId
-$parentMainWindowHandle        = (Get-Process -Id $parentProcessId).MainWindowHandle
+# The parent process may be gone again already, e.g. when the script was started through a launcher that
+# exits right away (like the elevation prompt does when the script is started with "Run as administrator"),
+# in which case there is no window handle and we use zero (= "no window found") instead
+$parentProcess                 = Get-Process -Id $parentProcessId -ErrorAction SilentlyContinue
+$parentMainWindowHandle        = $(if ($parentProcess) { $parentProcess.MainWindowHandle } else { [System.IntPtr]::Zero })
 $parentMainWindowMenuHandle    = $null
 $areWeAdmin                    = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $scriptStartDate               = Get-Date
