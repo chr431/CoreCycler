@@ -136,8 +136,17 @@ These are the PBO settings the run is based on:
 - At the start of every run, CoreCycler prints the PBO settings that are currently applied to the processor, which
   you can turn off with "showCurrentPboSettings = 0". This shows the Curve Optimizer value of every core, the PBO
   limits (PPT / TDC / EDC), the PBO scalar and the max boost frequency. It also works outside of the Automatic Test
-  Mode, so you can always check what your processor is currently running with.
+  Mode, so you can always check what your processor is currently running with. All values are read from the
+  processor, and they are displayed before CoreCycler applies any of its own values, so they show the actual
+  baseline the test run is based on.
    NOTE: Reading these values requires administrator privileges and PawnIO (for Ryzen).
+- In the Automatic Test Mode, this baseline is also captured at the start of the run and restored when the script
+  exits, no matter if it finished normally, was terminated with CTRL+C or ran into a fatal error. That way no test
+  values (neither Curve Optimizer values nor the max boost frequency) remain applied to the processor after the
+  run has ended, so an aborted run cannot destabilize the system afterwards. Note that the confirmed values are
+  still listed in the results file, they just are not kept applied.
+   NOTE: Outside of the Automatic Test Mode nothing is restored, there the last tested values remain applied, as
+         before.
 - With "pboMaxFrequency" you can set the PBO max boost frequency to an absolute value in MHz, which is the
   "Max CPU Boost Clock Override" setting in your BIOS. E.g. "pboMaxFrequency = 5000" sets the maximum boost
   frequency to 5000 MHz. The value is applied at the start of every run, including after an automatic resume, and
@@ -161,9 +170,11 @@ These are the PBO settings the run is based on:
 
 Other notes:
 - Because a crash cannot be attributed to a specific core with certainty, it is highly recommended to also enable
-  "setVoltageOnlyForTestedCore", so that all of the other cores run at a safe value while one core is being tested.
-  With this setting, cores that already have a good value are also set to the safe value - if you want to test the
-  combination of all of the found values instead, enable "applyConfirmedValuesForNotTestedCores".
+  "setVoltageOnlyForTestedCore", so that while a core is being tested, all of the other cores are not written at
+  all and keep the value they currently have (which is the baseline, resp. a safe value from
+  "voltageValueForNotTestedCores" that was written before the core testing started). With this setting, cores that
+  already have a good value keep it - if you want to test the combination of all of the found values instead,
+  enable "applyConfirmedValuesForNotTestedCores".
 - There is an internal safety limit for the number of test runs per core, which cannot be configured. If a core
   exceeds it (which should never happen), it is treated as "could not be stabilized" and the run continues with the
   remaining cores.

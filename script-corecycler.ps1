@@ -186,6 +186,9 @@ $zenStatesCoreDirectory                  = $PSScriptRoot + '\tools\SMUDebugTool'
 $zenStatesAssembly                       = $null
 $zenStatesCpu                            = $null
 $zenStatesCoreState                      = 'Uninitialized'
+# The PBO settings as they were found on the processor when the script started, before any value was applied
+# They are captured by Capture-PboBaseline and restored by Restore-PboBaseline when the script exits
+$pboBaseline                             = $null
 $autoModeFile                            = $PSScriptRoot + '\.automode'
 $autoModeFileTemp                        = $PSScriptRoot + '\.automode-temp'
 $autoModeFileBak                         = $PSScriptRoot + '\.automode-bak'
@@ -896,20 +899,24 @@ repeatCoreUntilConfirmed = 1
 
 
 # Set only the currently tested core to the selected Curve Optimizer / voltage offset value
-# All the other cores will be set to 0, resp. the value from "voltageValueForNotTestedCores",
-# or the determined maximum value if it's higher than any of those
-# This should prevent errors caused by other cores than the currently tested one, or at least diminish the chance for that
+# While a core is being tested, all the other cores are not written at all, they keep the value they currently
+# have. This should prevent errors caused by other cores than the currently tested one, or at least diminish
+# the chance for that
 #
 # Note: Currently this only has an effect for Ryzen processors, for Intel up to 14th gen there is only one voltage value
-# Note: Cores for which a good value has already been found are also set to "voltageValueForNotTestedCores",
-#       unless you enable the "applyConfirmedValuesForNotTestedCores" setting below
+# Note: The setting only takes effect once a core is actually being tested. Before that, e.g. at the start of a run
+#       or after a reboot, a value is written for every core: the cores then receive the value from
+#       "voltageValueForNotTestedCores", resp. the determined maximum value if it's higher than that
+# Note: Cores for which a good value has already been found keep that value if you enable the
+#       "applyConfirmedValuesForNotTestedCores" setting below
 #
 # Default: 0
 setVoltageOnlyForTestedCore = 0
 
 
-# If setVoltageOnlyForTestedCore above is enabled, you can define which Curve Optimizer / voltage offset value you want the other,
-# currently not tested cores to be set to
+# If setVoltageOnlyForTestedCore above is enabled, you can define which Curve Optimizer / voltage offset value you want
+# the other, currently not tested cores to be set to. This is only used when values are written for all cores, i.e.
+# before a core is actually being tested (see the notes above)
 #
 # Note: If the "current value" for a core is higher than what is entered here, e.g. derived from the "startValues" setting or
 # from errors during testing that caused an automatic adjustment, the higher value for this core will take priority over this setting
@@ -921,9 +928,9 @@ voltageValueForNotTestedCores = 0
 
 # Apply the already found good values to the cores that are not currently being tested
 # This setting only has an effect if "setVoltageOnlyForTestedCore" is enabled
-# By default all cores that are not currently being tested are set to "voltageValueForNotTestedCores", so that a
-# crash can only have been caused by the tested core
-# If you enable this setting, cores that already have a confirmed value will use that value instead. This tests the
+# By default all cores that are not currently being tested are not written at all while a core is being tested,
+# so that a crash can only have been caused by the tested core
+# If you enable this setting, cores that already have a confirmed value will receive that value. This tests the
 # combination of all of the found values, but if the computer now crashes, it may have been caused by one of those
 # other cores, and the result for the currently tested core may be wrong
 #
@@ -942,8 +949,8 @@ repeatCoreOnError = 1
 # Apply the Curve Optimizer / voltage offset values before every test run of a core
 #
 # Which values are written always follows the "setVoltageOnlyForTestedCore" setting:
-# - with it enabled, only the currently tested core receives its target value and all the other cores are set to
-#   "voltageValueForNotTestedCores"
+# - with it enabled, only the currently tested core receives its target value and all the other cores are
+#   not written at all
 # - with it disabled, every core receives its own value
 #
 # With "setVoltageOnlyForTestedCore = 1" the values are applied per core anyway, so enabling this setting changes
@@ -1005,6 +1012,11 @@ pboMaxFrequencyOffset = 0
 # Show the currently applied PBO settings at the start of the script
 # This prints the Curve Optimizer value of every core, the PBO limits (PPT / TDC / EDC), the PBO scalar and the
 # max boost frequency, as they are currently applied to the processor
+# The values are read from the processor and displayed before any value is applied by the script, so that they
+# show the actual baseline the test run is based on
+#
+# In the Automatic Test Mode this baseline is also captured and restored when the script exits (including a
+# CTRL+C termination), so that no test values remain applied to the processor after the run has ended
 #
 # Note: This does not change any settings, it is purely informational, and it also works without the
 #       Automatic Test Mode being enabled
@@ -3402,6 +3414,14 @@ function Show-FinalSummary {
             Write-ColorText('No adjustments to the Curve Optimizer values were necessary') Cyan
             Write-ColorText('Core      ' + $coCoresString) Cyan
             Write-ColorText('CO values ' + $startingCoString) Cyan
+        }
+
+        # In the Automatic Test Mode the PBO settings are restored to the baseline when the script exits,
+        # so the values above are the values of this test run, but not what the processor is running with
+        if ($useAutomaticTestMode -and $pboBaseline) {
+            Write-ColorText('Note: These are the values of this test run, they are not applied to the processor') Cyan
+            Write-ColorText('      anymore. The PBO settings have been restored to the baseline from before the') Cyan
+            Write-ColorText('      script started.') Cyan
         }
     }
 
@@ -7006,13 +7026,19 @@ function Get-CurveOptimizerValues {
 
 <#
 .DESCRIPTION
-    Set the new Curve Optimizer values
-.PARAMETER
-    [Void]
+    Runs ryzen-smu-cli to set the Curve Optimizer offsets
+    Logs the values that are being set as well as the per-core confirmation lines that the tool returns
+.PARAMETER OffsetString
+    [String] The offset argument for the tool. Either a plain list with one value per core ("-30,-25,..."),
+    or per-core pairs ("0:-30,3:-25") to only write the listed cores
 .OUTPUTS
     [Void]
 #>
-function Set-CurveOptimizerValues {
+function Invoke-RyzenSmuCliOffset {
+    param(
+        [Parameter(Mandatory=$true)] [String] $OffsetString
+    )
+
     <#
     .DESCRIPTION
         Error handler function for the for loop
@@ -7038,57 +7064,11 @@ function Set-CurveOptimizerValues {
 
 
 
-    Write-VerboseText('Trying to set the Curve Optimizer values')
-
     try {
-        if ($voltageCurrentValues.Count -gt $numPhysCores) {
-            Write-VerboseText('The amount of cores we''re trying to set is larger than the amount of physical cores!')
-        }
-
-
-        # If we only want to set the currently tested core, set the others to max($voltageValueForNotTestedCores, currentvalue)
-        if ($setVoltageOnlyForTestedCore) {
-            Write-DebugText('The flag to only set the voltage for the currently tested core is enabled')
-            Write-DebugText('Currently tested core: ' + $Script:currentlyTestedCore)
-            Write-DebugText('The original values:')
-            Write-DebugText($voltageCurrentValues)
-
-            if ([String]::IsNullOrWhiteSpace($Script:currentlyTestedCore)) {
-                Write-DebugText('Core testing hasn''t started yet, resetting all cores')
-            }
-
-            $voltageValuesToUse = @()
-
-            for ($i = 0; $i -lt $voltageCurrentValues.Count; $i++) {
-                if ($i -eq $Script:currentlyTestedCore) {
-                    $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
-                }
-
-                # If the setting is enabled, cores with an already confirmed value keep that value
-                elseif ($applyConfirmedValuesForNotTestedCores -and $useAutomaticTestMode -and $coreStates.ContainsKey($i) -and $coreStates[$i]['status'] -eq 'confirmed') {
-                    $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
-                }
-
-                else {
-                    # We may have allowed higher values than 0
-                    $voltageValuesToUse += [Math]::Max($voltageValueForNotTestedCores, $voltageCurrentValues[$i])
-                }
-            }
-
-            Write-DebugText('The modified values:')
-            Write-DebugText($voltageValuesToUse)
-        }
-        else {
-            $voltageValuesToUse = $voltageCurrentValues.Clone()
-        }
-
-        $coString = $voltageValuesToUse -Join ','
-
-
         Write-VerboseText('The values to set:')
-        Write-VerboseText($coString)
+        Write-VerboseText($OffsetString)
 
-        $argumentString = '--offset ' + $coString
+        $argumentString = '--offset ' + $OffsetString
 
         $setCoValuesProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
         $setCoValuesProcessInfo.FileName = $pboCliTool
@@ -7173,6 +7153,98 @@ function Set-CurveOptimizerValues {
     }
     catch {
         throw('Could not set the Curve Optimizer values!' + [Environment]::NewLine + 'Reason: ' + $_)
+    }
+}
+
+
+
+<#
+.DESCRIPTION
+    Set the new Curve Optimizer values
+    With "setVoltageOnlyForTestedCore" enabled and a core being tested, only that core (and, if the setting
+    is enabled, the cores with a confirmed value) is written, all the other cores are not touched at all
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Void]
+#>
+function Set-CurveOptimizerValues {
+    Write-VerboseText('Trying to set the Curve Optimizer values')
+
+
+    if ($voltageCurrentValues.Count -gt $numPhysCores) {
+        Write-VerboseText('The amount of cores we''re trying to set is larger than the amount of physical cores!')
+    }
+
+
+    # If we only want to set the currently tested core and a core is being tested, address only that core
+    # The other cores are not written at all, so they keep the value they currently have
+    if ($setVoltageOnlyForTestedCore -and -not [String]::IsNullOrWhiteSpace($Script:currentlyTestedCore)) {
+        Write-DebugText('The flag to only set the voltage for the currently tested core is enabled')
+        Write-DebugText('Currently tested core: ' + $Script:currentlyTestedCore)
+        Write-DebugText('The original values:')
+        Write-DebugText($voltageCurrentValues)
+
+        $coreValuePairs = @()
+
+        for ($i = 0; $i -lt $voltageCurrentValues.Count; $i++) {
+            # The currently tested core always receives its value
+            if ($i -eq $Script:currentlyTestedCore) {
+                $coreValuePairs += ($i.ToString() + ':' + [Int] $voltageCurrentValues[$i])
+            }
+
+            # If the setting is enabled, cores with an already confirmed value keep that value
+            elseif ($applyConfirmedValuesForNotTestedCores -and $useAutomaticTestMode -and $coreStates.ContainsKey($i) -and $coreStates[$i]['status'] -eq 'confirmed') {
+                $coreValuePairs += ($i.ToString() + ':' + [Int] $voltageCurrentValues[$i])
+            }
+        }
+
+        Write-DebugText('The cores and values to set:')
+        Write-DebugText($coreValuePairs)
+
+        if ($coreValuePairs.Count -eq 0) {
+            throw('Could not set the Curve Optimizer values!' + [Environment]::NewLine + 'Reason: No core was found to set a value for (currently tested core: ' + $Script:currentlyTestedCore + ')')
+        }
+
+        Write-VerboseText('Only setting the values for the currently tested core' + $(if ($applyConfirmedValuesForNotTestedCores) { ' and the cores with a confirmed value' }) + ', all the other cores keep their current value')
+
+        Invoke-RyzenSmuCliOffset -OffsetString ($coreValuePairs -Join ',')
+    }
+
+    # Otherwise every core receives a value
+    else {
+        if ($setVoltageOnlyForTestedCore) {
+            Write-DebugText('Core testing hasn''t started yet, setting the values for all cores')
+        }
+
+        $voltageValuesToUse = @()
+
+        for ($i = 0; $i -lt $voltageCurrentValues.Count; $i++) {
+            if ($i -eq $Script:currentlyTestedCore) {
+                $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
+            }
+
+            # If the setting is enabled, cores with an already confirmed value keep that value
+            elseif ($applyConfirmedValuesForNotTestedCores -and $useAutomaticTestMode -and $coreStates.ContainsKey($i) -and $coreStates[$i]['status'] -eq 'confirmed') {
+                $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
+            }
+
+            # When only the tested core should get a voltage, the other cores are set to
+            # max($voltageValueForNotTestedCores, current value)
+            elseif ($setVoltageOnlyForTestedCore) {
+                # We may have allowed higher values than 0
+                $voltageValuesToUse += [Math]::Max($voltageValueForNotTestedCores, $voltageCurrentValues[$i])
+            }
+
+            else {
+                $voltageValuesToUse += [Int] $voltageCurrentValues[$i]
+            }
+        }
+
+        Write-DebugText('The modified values:')
+        Write-DebugText($voltageValuesToUse)
+
+        Invoke-RyzenSmuCliOffset -OffsetString ($voltageValuesToUse -Join ',')
     }
 }
 
@@ -7532,6 +7604,160 @@ function Get-PboScalar {
 
 <#
 .DESCRIPTION
+    Captures the PBO settings that are currently applied to the processor, before the script applies any of
+    its own values. This has to happen before any Curve Optimizer value or max boost frequency is written,
+    and the captured values are restored by Restore-PboBaseline when the script exits
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Void]
+#>
+function Capture-PboBaseline {
+    # Intel has no Curve Optimizer and no PBO max boost frequency, and without administrator privileges
+    # nothing can be read (or written) anyway, so there is nothing to capture and nothing to restore
+    if ($isIntelProcessor -or !$areWeAdmin) {
+        Write-DebugText('Not capturing a PBO baseline' + $(if ($isIntelProcessor) { ' (Intel processor)' } else { ' (no administrator privileges)' }))
+        return
+    }
+
+
+    $coValues = $null
+
+    try {
+        $coValues = @(Get-CurveOptimizerValues)
+    }
+    catch {
+        Write-DebugText('Could not read the Curve Optimizer values for the baseline: ' + $_.Exception.Message)
+    }
+
+
+    $maxFrequency = 0
+
+    if (Test-PboMaxFrequencyIsWritable) {
+        $maxFrequency = Get-PboMaxFrequency
+    }
+
+
+    $Script:pboBaseline = @{
+        'coValues' = $coValues
+        'fMax'     = $maxFrequency
+    }
+
+    Write-VerboseText('The baseline Curve Optimizer values, as read from the processor before any value is applied:')
+
+    if ($coValues -and $coValues.Count -gt 0) {
+        Write-VerboseText(($coValues -Join ','))
+    }
+    else {
+        Write-VerboseText('could not be read')
+    }
+
+    Write-VerboseText('The baseline max boost frequency: ' + $(if ($maxFrequency -gt 0) { ($maxFrequency.ToString() + ' MHz') } else { 'not available' }))
+}
+
+
+
+<#
+.DESCRIPTION
+    Restores the PBO settings that were captured by Capture-PboBaseline when the script started
+    This is called when the script exits, so that no test values remain applied to the processor
+.PARAMETER
+    [Void]
+.OUTPUTS
+    [Void]
+#>
+function Restore-PboBaseline {
+    # Only the Automatic Test Mode writes values that may be unsafe to keep applied after the script
+    # has ended, in the other modes the last tested values are deliberately left applied
+    if (!$useAutomaticTestMode) {
+        return
+    }
+
+    if (!$Script:pboBaseline) {
+        Write-DebugText('No PBO baseline was captured, not restoring anything')
+        return
+    }
+
+
+    Write-Text('')
+    Write-ColorText('Restoring the PBO settings to the state from before the script started...') Cyan
+
+
+    $baselineCoValues = $Script:pboBaseline['coValues']
+    $baselineFMax     = $Script:pboBaseline['fMax']
+
+
+    # Restore the Curve Optimizer values, but only if they differ from the current ones
+    if ($baselineCoValues -and @($baselineCoValues).Count -gt 0) {
+        $needsRestore = $true
+
+        try {
+            $currentCoValues = @(Get-CurveOptimizerValues)
+
+            if ($currentCoValues -and $currentCoValues.Count -eq @($baselineCoValues).Count) {
+                $needsRestore = $false
+
+                for ($i = 0; $i -lt $currentCoValues.Count; $i++) {
+                    if ([Int] $currentCoValues[$i] -ne [Int] $baselineCoValues[$i]) {
+                        $needsRestore = $true
+                        break
+                    }
+                }
+            }
+        }
+        catch {
+            Write-DebugText('Could not read the current Curve Optimizer values, restoring the baseline values: ' + $_.Exception.Message)
+        }
+
+
+        if ($needsRestore) {
+            Write-VerboseText('The baseline Curve Optimizer values to restore:')
+            Write-VerboseText(($baselineCoValues -Join ','))
+
+            try {
+                # The baseline covers every core, so the full list is written
+                Invoke-RyzenSmuCliOffset -OffsetString (@($baselineCoValues) -Join ',')
+                Write-Text('The baseline Curve Optimizer values have been restored')
+            }
+            catch {
+                Write-ColorText('Could not restore the baseline Curve Optimizer values!') Red
+                Write-ColorText('Reason: ' + $_.Exception.Message) Red
+            }
+        }
+        else {
+            Write-VerboseText('The Curve Optimizer values are already at the baseline, not restoring them')
+        }
+    }
+    else {
+        Write-VerboseText('No baseline Curve Optimizer values were captured, not restoring them')
+    }
+
+
+    # Restore the max boost frequency, but only if it is writable, was captured, and differs from the current one
+    if ($baselineFMax -gt 0 -and (Test-PboMaxFrequencyIsWritable)) {
+        $currentFMax = Get-PboMaxFrequency
+
+        if ($currentFMax -gt 0 -and $currentFMax -ne $baselineFMax) {
+            if (Set-PboMaxFrequency -frequency $baselineFMax) {
+                Write-Text('The baseline max boost frequency has been restored (' + $baselineFMax + ' MHz)')
+            }
+            else {
+                Write-ColorText('Could not restore the baseline max boost frequency (' + $baselineFMax + ' MHz)!') Red
+            }
+        }
+        else {
+            Write-VerboseText('The max boost frequency is already at the baseline (' + $currentFMax + ' MHz), not restoring it')
+        }
+    }
+    else {
+        Write-VerboseText('No baseline max boost frequency was captured, not restoring it')
+    }
+}
+
+
+
+<#
+.DESCRIPTION
     Print the currently applied PBO settings: the Curve Optimizer value of every core, the PBO limits,
     the PBO scalar and the max boost frequency
     This is meant to be shown at the start of a run, so that it is clear which settings the test is based on
@@ -7561,19 +7787,22 @@ function Show-PboSettings {
     }
 
 
-    # The Curve Optimizer values, either from the tracked state or read from the processor
-    $coValues = $null
+    # The Curve Optimizer values are read from the processor, so that the actual state is displayed
+    # Only if they cannot be read do we fall back to the values tracked by the script, which are the
+    # target values of the run and may not be what the processor currently has
+    $coValues           = $null
+    $coValuesAreTracked = $false
 
-    if ($voltageCurrentValues -and @($voltageCurrentValues).Count -gt 0) {
-        $coValues = @($voltageCurrentValues)
+    try {
+        $coValues = @(Get-CurveOptimizerValues)
     }
-    else {
-        try {
-            $coValues = @(Get-CurveOptimizerValues)
-        }
-        catch {
-            Write-DebugText('Could not read the Curve Optimizer values: ' + $_.Exception.Message)
-        }
+    catch {
+        Write-DebugText('Could not read the Curve Optimizer values: ' + $_.Exception.Message)
+    }
+
+    if ((!$coValues -or $coValues.Count -eq 0) -and $voltageCurrentValues -and @($voltageCurrentValues).Count -gt 0) {
+        $coValues           = @($voltageCurrentValues)
+        $coValuesAreTracked = $true
     }
 
 
@@ -7591,6 +7820,10 @@ function Show-PboSettings {
 
         Write-ColorText('Core            ' + ($coreLabels -Join ' |')) Cyan
         Write-ColorText('CO values       ' + ($coStrings  -Join ' |')) Cyan
+
+        if ($coValuesAreTracked) {
+            Write-ColorText('(could not be read from the processor, these are the values tracked by the script)') DarkGray
+        }
     }
     else {
         Write-SettingIntroText -Text 'CO values' -Setting 'could not be read'
@@ -12505,6 +12738,11 @@ function Test-AutomaticTestModeIncrease {
 
             Set-CoreState -coreNumber $actualCoreNumber -status 'testing' -value $newValue
 
+            # Store the core as the currently tested core, so that with "setVoltageOnlyForTestedCore"
+            # enabled only this core is written when the new values are applied below
+            # This is especially relevant for a resume, where the main loop hasn't set it yet
+            $Script:currentlyTestedCore = $actualCoreNumber
+
             # Apply the new values
             # This happens only after the new value has been stored, so that a crash while it is being applied cannot
             # make the script set the same crashing value again after the resume
@@ -14971,6 +15209,20 @@ try {
 
 
 
+    # Capture the PBO settings as they are currently applied to the processor, before any value is written
+    # They are restored again when the script exits
+    # This has to happen before the Automatic Test Mode initialization, which already applies values
+    Capture-PboBaseline
+
+
+    # Show the PBO settings that are currently applied to the processor
+    # This is done for both modes, so that it is always visible which settings a test run is based on
+    # It also has to happen before any values are applied, so that the real baseline is displayed
+    if ($settings.AutomaticTestMode.showCurrentPboSettings -gt 0) {
+        Show-PboSettings
+    }
+
+
     # Check if the Automatic Test Mode feature is enabled
     Initialize-AutomaticTestMode
 
@@ -15090,11 +15342,8 @@ try {
     }
 
 
-    # Show the PBO settings that are currently applied to the processor
-    # This is done for both modes, so that it is always visible which settings a test run is based on
-    if ($settings.AutomaticTestMode.showCurrentPboSettings -gt 0) {
-        Show-PboSettings
-    }
+    # The PBO settings that are currently applied have already been displayed before the Automatic Test Mode
+    # initialization, as that already applies values to the processor
 
 
     if ($settings.mode -eq 'CUSTOM') {
@@ -15980,8 +16229,9 @@ try {
 
             # Set the voltage before the test run
             # The values that are written always follow the "setVoltageOnlyForTestedCore" setting:
-            # with it enabled only the tested core receives its target value while all the other cores are set to
-            # "voltageValueForNotTestedCores", and with it disabled every core keeps its own value
+            # with it enabled only the tested core receives its target value while all the other cores are
+            # not written at all and keep the value they currently have, and with it disabled every core
+            # receives its own value
             #
             # With "setVoltageOnlyForTestedCore" the values are applied per core anyway, so nothing changes here
             # Enabling "applyValuesBeforeEachTest" additionally applies them before every test run even when
@@ -17079,6 +17329,18 @@ finally {
                 Write-VerboseText($errorResult.errorMessage)
             }
         }
+    }
+
+
+    # Restore the PBO settings to the state from before the script started, so that no test values
+    # remain applied to the processor after the script has ended (Automatic Test Mode only)
+    # This has to happen before any of the exit paths below, so that it runs no matter how we got here
+    try {
+        Restore-PboBaseline
+    }
+    catch {
+        Write-ColorText('Could not restore the PBO baseline!') Red
+        Write-ColorText('Reason: ' + $_.Exception.Message) Red
     }
 
 
